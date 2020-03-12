@@ -1,6 +1,8 @@
-use async_std::net::{ TcpListener, ToSocketAddrs, TcpStream };
+use async_std::net::{ TcpListener, TcpStream, ToSocketAddrs, SocketAddr, IpAddr, Ipv4Addr };
 use async_std::prelude::*;
 use async_std::task;
+use std::str;
+use async_std::io::copy;
 
 const SOCKS5_VERSION: u8 = 0x05;
 const SOCKS5_AUTH_METHOD_NONE: u8 = 0x00;
@@ -65,7 +67,7 @@ async fn connection_loop(mut stream: TcpStream) -> Result<()> {
   // +----+--------+
   // | 1  |   1    |
   // +----+--------+
-  let response = [SOCKS5_VERSION,  SOCKS5_AUTH_METHOD_NONE];
+  let response = [SOCKS5_VERSION, SOCKS5_AUTH_METHOD_NONE];
   stream.write(&response).await?;
 
   // +----+-----+-------+------+----------+----------+
@@ -85,20 +87,62 @@ async fn connection_loop(mut stream: TcpStream) -> Result<()> {
   }
   let mut addr_type = [0u8; 1];
   stream.read_exact(&mut addr_type).await?;
-  match addr_type[0] {
+  enum DestAddrType {
+    Ipv4([u8; 4]),
+    Domain(Vec<u8>),
+    Unknown,
+  }
+  let dest_addr_type = match addr_type[0] {
     SOCKS5_ADDR_TYPE_IPV4 => {
-      unimplemented!()
-    },
+      let mut ipv4_addr = [0u8; 4];
+      stream.read_exact(&mut ipv4_addr).await?;
+      DestAddrType::Ipv4(ipv4_addr)
+    }
     SOCKS5_ADDR_TYPE_DOMAIN => {
-      unimplemented!()
-    },
-    SOCKS5_ADDR_TYPE_IPV6 => {
-      unimplemented!()
-    },
-    _ => Err("Unknown destination addr type")?
+      let mut domain_size = [0u8; 1];
+      stream.read_exact(&mut domain_size).await?;
+      let domain_size = domain_size[0] as usize;
+      let mut domain_addr = vec![0u8; domain_size];
+      stream.read_exact(&mut domain_addr).await?;
+      DestAddrType::Domain(domain_addr)
+    }
+    SOCKS5_ADDR_TYPE_IPV6 => DestAddrType::Unknown,
+    _ => DestAddrType::Unknown,
   };
-  let mut port = [0u8; 2];
-  stream.read_exact(&mut port).await?;
+  let mut dest_addr_port = [0u8; 2];
+  stream.read_exact(&mut dest_addr_port).await?;
+  let dest_addr_port = dest_addr_port[0] as u16 * 256 + dest_addr_port[1] as u16;
+  //
+  // @todo reply client
+  //
+  enum DestStream {
+    DestStream(TcpStream),
+    Unknown(String)
+  }
+  let stream = match dest_addr_type {
+    DestAddrType::Ipv4(ipv4_addr) => {
+      let socket_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(ipv4_addr[0], ipv4_addr[1], ipv4_addr[2], ipv4_addr[3])), dest_addr_port);
+      let dest_stream = TcpStream::connect(socket_addr).await?;
+      DestStream::DestStream(dest_stream)
+    },
+    DestAddrType::Domain(domain_addr) => {
+      let domain = str::from_utf8(&domain_addr)?;
+      let dest_stream = TcpStream::connect(format!("{}{}", domain, dest_addr_port)).await?;
+      DestStream::DestStream(dest_stream)
+    },
+    _ => DestStream::Unknown("Unknown destination addr type".to_string())
+  };
+  match stream {
+    DestStream::Unknown(s) => {
+      Err(s)?
+    },
+    DestStream::DestStream(dest_stream) => {
+      //
+      // @todo copy stream
+      //
+      unimplemented!()
+    } 
+  }
 
   unimplemented!()
 }
