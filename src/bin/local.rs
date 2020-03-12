@@ -4,6 +4,7 @@ use std::io::{ copy };
 
 fn main() {
   let listener = TcpListener::bind("127.0.0.1:1186").unwrap();
+  println!("listening 127.0.0.1:1186");
   for stream in listener.incoming() {
     let stream = stream.unwrap();
     thread::spawn(move || {
