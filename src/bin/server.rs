@@ -1,113 +1,219 @@
-use std::io::{Read, Write, copy};
-use std::net::{Shutdown, TcpListener, TcpStream, SocketAddr, IpAddr, Ipv4Addr};
-use std::thread;
+use async_std::io;
+use async_std::net::{
+  IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs,
+};
+use async_std::prelude::*;
+use async_std::task;
 use std::str;
-use std::time::Duration;
 
-fn main() {
-  let listener = TcpListener::bind("127.0.0.1:8080").unwrap();
-  println!("listening 127.0.0.1:8080");
-  for stream in listener.incoming() {
-    let stream = stream.unwrap();
-    thread::spawn(move || {
-      handle_connection(stream);
-    });
-  }
+const SOCKS5_VERSION: u8 = 0x05;
+const SOCKS5_AUTH_METHOD_NONE: u8 = 0x00;
+const SOCKS5_CMD_TCP_CONNECT: u8 = 0x01;
+const SOCKS5_RSV: u8 = 0x00;
+const SOCKS5_ADDR_TYPE_IPV4: u8 = 0x01;
+const SOCKS5_ADDR_TYPE_DOMAIN: u8 = 0x03;
+const SOCKS5_ADDR_TYPE_IPV6: u8 = 0x04;
+const SOCKS5_REPLY_SUCCEEDED: u8 = 0x00;
+
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+fn main() -> Result<()> {
+  run()
 }
 
-fn handle_connection(mut stream: TcpStream) {
-  let mut buf = [0; 3];
-  stream.read(&mut buf).unwrap();
-  if buf[0] != 0x05 {
-    stream.shutdown(Shutdown::Both).unwrap();
-    println!("shutdown");
-    return;
+fn run() -> Result<()> {
+  let fut = accept_loop("127.0.0.1:8080");
+  println!("listening 127.0.0.1:8080");
+  task::block_on(fut)
+}
+
+async fn accept_loop(addr: impl ToSocketAddrs) -> Result<()> {
+  let listener = TcpListener::bind(addr).await?;
+  let mut incoming = listener.incoming();
+  while let Some(stream) = incoming.next().await {
+    let stream = stream?;
+    println!("Accept from {}", stream.peer_addr()?);
+    spawn_and_log_error(connection_loop(stream));
+  }
+  Ok(())
+}
+
+fn spawn_and_log_error<F>(fut: F) -> task::JoinHandle<()>
+where
+  F: Future<Output = Result<()>> + Send + 'static,
+{
+  task::spawn(async move {
+    if let Err(e) = fut.await {
+      eprintln!("{}", e)
+    }
+  })
+}
+
+async fn connection_loop(mut stream: TcpStream) -> Result<()> {
+  // +----+----------+----------+
+  // |VER | NMETHODS | METHODS  |
+  // +----+----------+----------+
+  // | 1  |    1     | 1 to 255 |
+  // +----+----------+----------+
+  let mut version = [0u8; 1];
+  stream.read_exact(&mut version).await?;
+  if version[0] != SOCKS5_VERSION {
+    Err("Only support socks 5 version")?
+  }
+  let mut _methods_count = [0u8; 1];
+  stream.read_exact(&mut _methods_count).await?;
+  let mut methods = vec![0u8; 255];
+  let size = stream.read(&mut methods).await?;
+  methods.truncate(size);
+  let mut has_methods = false;
+  for method in methods {
+    if method == SOCKS5_AUTH_METHOD_NONE {
+      has_methods = true;
+      break;
+    }
+  }
+  if !has_methods {
+    Err("Haven't connect method")?
   }
 
-  stream.write_all(&[5, 0]).unwrap();
+  // +----+--------+
+  // |VER | METHOD |
+  // +----+--------+
+  // | 1  |   1    |
+  // +----+--------+
+  let response = [SOCKS5_VERSION, SOCKS5_AUTH_METHOD_NONE];
+  stream.write(&response).await?;
 
-  let mut addr_buf = [0; 4];
-  stream.read_exact(&mut addr_buf).unwrap();
-  if addr_buf[0] != 5 || addr_buf[1] != 1 {
-    stream.shutdown(Shutdown::Both).unwrap();
-    println!("shutdown");
-    return;
+  // +----+-----+-------+------+----------+----------+
+  // |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
+  // +----+-----+-------+------+----------+----------+
+  // | 1  |  1  | X'00' |  1   | Variable |    2     |
+  // +----+-----+-------+------+----------+----------+
+  let mut version = [0u8; 1];
+  stream.read_exact(&mut version).await?;
+  if version[0] != SOCKS5_VERSION {
+    Err("Only support socks 5 version")?
   }
-  enum Destination {
-    Ipv4(SocketAddr),
-    DomainName(Vec<u8>, u16),
+  let mut cmd = [0u8; 2];
+  stream.read_exact(&mut cmd).await?;
+  if cmd[0] != SOCKS5_CMD_TCP_CONNECT {
+    Err("Only support TCP connection")?
+  }
+  let mut addr_type = [0u8; 1];
+  stream.read_exact(&mut addr_type).await?;
+  enum DestAddrType {
+    Ipv4([u8; 4]),
+    Domain(Vec<u8>),
     Unknown,
   }
-  let addr = match addr_buf[3] {
-    0x01 => {
-      let mut buf = vec![0u8; 6];
-      stream.read_exact(&mut buf).unwrap();
-      let socket_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3])),
-      buf[4] as u16 * 256 + buf[5] as u16);
-      let temp: Vec<u8> = vec![0x05, 0x00, 0x00, 0x01];
-      stream.write_all(&[temp, buf].concat()).unwrap();
-      Destination::Ipv4(socket_addr)
-    },
-    0x03 => {
-      let mut len = [0u8; 1];
-      stream.read_exact(&mut len).unwrap();
-      let len = len[0] as usize;
-      let mut buf = vec![0u8; len];
-      stream.read_exact(&mut buf).unwrap();
-      let mut port = vec![0u8; 2];
-      stream.read_exact(&mut port).unwrap();
-
-      let temp: Vec<u8> = vec![0x05, 0x00, 0x00, 0x03];
-      stream.write_all(&[temp, vec![len as u8], buf.clone(), port.clone()].concat()).unwrap();
-
-      Destination::DomainName(buf, port[0] as u16 * 256 + port[1] as u16)
-    },
-    0x04 => Destination::Unknown,
-    _ => Destination::Unknown,
+  let (dest_addr_type, reply_atyp) = match addr_type[0] {
+    SOCKS5_ADDR_TYPE_IPV4 => {
+      let mut ipv4_addr = [0u8; 4];
+      stream.read_exact(&mut ipv4_addr).await?;
+      (DestAddrType::Ipv4(ipv4_addr), SOCKS5_ADDR_TYPE_IPV4)
+    }
+    SOCKS5_ADDR_TYPE_DOMAIN => {
+      let mut domain_size = [0u8; 1];
+      stream.read_exact(&mut domain_size).await?;
+      let domain_size = domain_size[0] as usize;
+      let mut domain_addr = vec![0u8; domain_size];
+      stream.read_exact(&mut domain_addr).await?;
+      (DestAddrType::Domain(domain_addr), SOCKS5_ADDR_TYPE_DOMAIN)
+    }
+    SOCKS5_ADDR_TYPE_IPV6 => (DestAddrType::Unknown, 0),
+    _ => (DestAddrType::Unknown, 0),
   };
+  let mut dest_addr_port = [0u8; 2];
+  stream.read_exact(&mut dest_addr_port).await?;
 
-  match addr {
-    Destination::Ipv4(socket_addr) => {
-      let dest_stream = TcpStream::connect(socket_addr).unwrap();
-      dest_stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-      let mut client_reader = stream.try_clone().unwrap();
-      let mut socket_writer = dest_stream.try_clone().unwrap();
-
-      thread::spawn(move || {
-        copy(&mut client_reader, &mut socket_writer).unwrap();
-        client_reader.shutdown(Shutdown::Read).unwrap();
-        socket_writer.shutdown(Shutdown::Write).unwrap();
+  // +----+-----+-------+------+----------+----------+
+  // |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
+  // +----+-----+-------+------+----------+----------+
+  // | 1  |  1  | X'00' |  1   | Variable |    2     |
+  // +----+-----+-------+------+----------+----------+
+  let reply_vec = vec![
+    SOCKS5_VERSION,
+    SOCKS5_REPLY_SUCCEEDED,
+    SOCKS5_RSV,
+    reply_atyp,
+  ];
+  match &dest_addr_type {
+    DestAddrType::Ipv4(ipv4_addr) => {
+      let reply = [reply_vec, ipv4_addr.to_vec(), dest_addr_port.to_vec()].concat();
+      stream.write(&reply).await?;
+    }
+    DestAddrType::Domain(domain_addr) => {
+      let domain_size = domain_addr.len();
+      let domain_size = vec![domain_size as u8];
+      let reply = [
+        reply_vec,
+        domain_size,
+        domain_addr.clone(),
+        dest_addr_port.to_vec(),
+      ]
+      .concat();
+      stream.write(&reply).await?;
+    }
+    _ => (),
+  };
+  let dest_addr_port = dest_addr_port[0] as u16 * 256 + dest_addr_port[1] as u16;
+  enum DestStream {
+    DestStream(TcpStream),
+    Unknown(String),
+  }
+  let dest_stream = match dest_addr_type {
+    DestAddrType::Ipv4(ipv4_addr) => {
+      let socket_addr = SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::new(
+          ipv4_addr[0],
+          ipv4_addr[1],
+          ipv4_addr[2],
+          ipv4_addr[3],
+        )),
+        dest_addr_port,
+      );
+      let dest_stream = TcpStream::connect(socket_addr).await?;
+      DestStream::DestStream(dest_stream)
+    }
+    DestAddrType::Domain(domain_addr) => {
+      let domain = str::from_utf8(&domain_addr)?;
+      let addr = format!("{}:{}", domain, dest_addr_port);
+      let dest_stream = TcpStream::connect(addr).await?;
+      DestStream::DestStream(dest_stream)
+    }
+    _ => DestStream::Unknown("Unknown destination addr type".to_string()),
+  };
+  match dest_stream {
+    DestStream::Unknown(s) => {
+      stream.shutdown(Shutdown::Both)?;
+      Err(s)?
+    }
+    DestStream::DestStream(mut dest_stream) => {
+      //
+      // @todo copy stream
+      //
+      let mut stream_reader = stream.clone();
+      let mut dest_stream_writer = dest_stream.clone();
+      task::spawn(async move {
+        if let Err(e) = io::copy(&mut stream_reader, &mut dest_stream_writer).await {
+          println!("{}", e);
+        };
+        if let Err(e) = stream_reader.shutdown(Shutdown::Read) {
+          println!("{}", e);
+        };
+        if let Err(e) = dest_stream_writer.shutdown(Shutdown::Write) {
+          println!("{}", e);
+        };
       });
+      io::copy(&mut dest_stream, &mut stream).await?;
+      if let Err(e) = stream.shutdown(Shutdown::Write) {
+        println!("{}", e);
+      };
+      if let Err(e) = dest_stream.shutdown(Shutdown::Read) {
+        println!("{}", e);
+      };
 
-      let mut socket_reader = dest_stream.try_clone().unwrap();
-      let mut client_writer = stream.try_clone().unwrap();
-
-      copy(&mut socket_reader, &mut client_writer).unwrap();
-      socket_reader.shutdown(Shutdown::Read).unwrap();
-      client_writer.shutdown(Shutdown::Write).unwrap();
-    },
-    Destination::DomainName(buf, port) => {
-      let dest_stream = TcpStream::connect(format!("{}:{}", str::from_utf8(&buf).unwrap(), port)).expect("domain dest connect fail");
-      dest_stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-      let mut client_reader = stream.try_clone().unwrap();
-      let mut socket_writer = dest_stream.try_clone().unwrap();
-
-      thread::spawn(move || {
-        copy(&mut client_reader, &mut socket_writer).unwrap();
-        client_reader.shutdown(Shutdown::Read).unwrap();
-        socket_writer.shutdown(Shutdown::Write).unwrap();
-      });
-
-      let mut socket_reader = dest_stream.try_clone().unwrap();
-      let mut client_writer = stream.try_clone().unwrap();
-
-      copy(&mut socket_reader, &mut client_writer).unwrap();
-      socket_reader.shutdown(Shutdown::Read).unwrap();
-      client_writer.shutdown(Shutdown::Write).unwrap();
-
-    },
-    Destination::Unknown => {
-      stream.shutdown(Shutdown::Both).unwrap();
+      Ok(())
     }
   }
 }
