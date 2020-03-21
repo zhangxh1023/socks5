@@ -1,7 +1,12 @@
-use async_std::net::{ TcpListener, ToSocketAddrs, TcpStream, Shutdown };
-use async_std::task;
-use async_std::prelude::*;
 use async_std::io;
+use async_std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
+use async_std::prelude::*;
+use async_std::task;
+
+use hyper::service::{make_service_fn, service_fn};
+use hyper::{Body, Request, Response, Server, Client};
+use std::convert::Infallible;
+use std::net::SocketAddr;
 
 const SOCKS5_VERSION: u8 = 0x05;
 const SOCKS5_AUTH_METHOD_NONE: u8 = 0x00;
@@ -21,10 +26,9 @@ fn main() -> Result<()> {
 fn run() -> Result<()> {
   let socks5_fut = socks5_accept_loop("127.0.0.1:1186");
   println!("listening 127.0.0.1:1186");
-  let http_fut = http_accept_loop("127.0.0.1:1187");
-  println!("listening 127.0.0.1:1187");
   task::spawn(async {
-    task::block_on(http_fut)
+    println!("listening 127.0.0.1:1187");
+    http_accept_loop("127.0.0.1:1187");
   });
   task::block_on(socks5_fut)
 }
@@ -40,15 +44,90 @@ async fn socks5_accept_loop(addr: impl ToSocketAddrs) -> Result<()> {
   Ok(())
 }
 
-async fn http_accept_loop(addr: impl ToSocketAddrs) -> Result<()> {
-  let listener = TcpListener::bind(addr).await?;
-  let mut incoming = listener.incoming();
-  while let Some(stream) = incoming.next().await {
-    let stream = stream?;
-    println!("Accept from {}", stream.peer_addr()?);
-    spawn_and_log_error(http_handle(stream));
+#[tokio::main]
+async fn http_accept_loop(addr: impl ToSocketAddrs) {
+  // We'll bind to 127.0.0.1:3000
+  let addr = SocketAddr::from(([127, 0, 0, 1], 1187));
+
+  // A `Service` is needed for every connection, so this
+  // creates one from our `hello_world` function.
+  let make_svc = make_service_fn(|_conn| async {
+    // service_fn converts our function into a `Service`
+    Ok::<_, Infallible>(service_fn(http_handle))
+  });
+
+  let server = Server::bind(&addr).serve(make_svc);
+
+  // Run this server for... forever!
+  if let Err(e) = server.await {
+    eprintln!("server error: {}", e);
   }
-  Ok(())
+}
+
+async fn http_handle(req: Request<Body>) -> Result<Response<Body>> {
+  let mut dest_stream = TcpStream::connect("127.0.0.1:8080").await?;
+  let buf = [SOCKS5_VERSION, 1, SOCKS5_AUTH_METHOD_NONE];
+  dest_stream.write_all(&buf).await?;
+
+  let mut buf = [0u8; 2];
+  dest_stream.read_exact(&mut buf).await?;
+
+  let req_uri = format!("{}", req.uri());
+  let req_uri_slice: Vec<&str> = req_uri.split(":").collect();
+  let base_buf = vec![SOCKS5_VERSION, SOCKS5_CMD_TCP_CONNECT, SOCKS5_RSV, SOCKS5_ADDR_TYPE_DOMAIN];
+  let domain_bytes = req_uri_slice[0].as_bytes().to_vec();
+  let port_bytes = if let Some(s) = req_uri_slice.get(1) {
+    s.as_bytes().to_vec()
+  } else {
+    "80".as_bytes().to_vec()
+  };
+  let domain_len = vec![domain_bytes.len() as u8];
+
+  let buf = [
+    base_buf,
+    domain_len,
+    domain_bytes,
+    port_bytes,
+  ].concat();
+
+  dest_stream.write_all(&buf).await?;
+
+  let mut buf = [0u8; 4];
+  dest_stream.read_exact(&mut buf).await?;
+
+  match buf[3] {
+    SOCKS5_ADDR_TYPE_IPV4 => {
+      let mut buf = [0u8; 4];
+      dest_stream.read_exact(&mut buf).await?;
+    },
+    SOCKS5_ADDR_TYPE_DOMAIN => {
+      let mut domain_size = [0u8; 1];
+      dest_stream.read_exact(&mut domain_size).await?;
+      let mut buf = vec![0u8; domain_size[0] as usize];
+      dest_stream.read_exact(&mut buf).await?;
+    },
+    SOCKS5_ADDR_TYPE_IPV6 => {
+      let mut buf = [0u8; 16];
+      dest_stream.read_exact(&mut buf).await?;
+    },
+    _ => (),
+  };
+
+  let mut buf = [0u8; 2];
+  dest_stream.read_exact(&mut buf).await?;
+
+  let client = Client::new();
+
+  println!("request remote uri: {}", req.uri());
+
+  match client.request(req).await {
+    Ok(response) => Ok(response),
+    Err(e) => {
+      println!("{}", e);
+      let response = Response::new(Body::empty());
+      Ok(response)
+    }
+  }
 }
 
 fn spawn_and_log_error<F>(fut: F) -> task::JoinHandle<()>
@@ -88,11 +167,4 @@ async fn socks5_handle(mut stream: TcpStream) -> Result<()> {
   };
 
   Ok(())
-}
-
-async fn http_handle(mut stream: TcpStream) -> Result<()> {
-
-
-
-  unimplemented!()
 }
